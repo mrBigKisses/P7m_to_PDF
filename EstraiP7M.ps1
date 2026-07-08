@@ -3,10 +3,36 @@
 #  Estrae file PDF (o qualsiasi payload) da buste .p7m
 #  Supporta file singolo, cartella, ricorsione sottocartelle
 #  Output sempre in sottocartella _PDF accanto all'originale
+#
+#  Richiede Windows PowerShell 5.1 (.NET Framework): il tipo
+#  SignedCms non e' disponibile nell'assembly System.Security
+#  sotto PowerShell 7+ (pwsh). Avviare con powershell.exe.
 # ============================================================
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Security
+param(
+    [Parameter(Position = 0)]
+    [string]$Path
+)
+
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    Add-Type -AssemblyName System.Security -ErrorAction Stop
+}
+catch {
+    Write-Error "Impossibile caricare gli assembly richiesti: $($_.Exception.Message)"
+    exit 1
+}
+
+if (-not ("System.Security.Cryptography.Pkcs.SignedCms" -as [type])) {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Questo script richiede Windows PowerShell 5.1 (.NET Framework).`n`n" + `
+        "Il tipo SignedCms non e' disponibile nell'assembly System.Security quando " + `
+        "eseguito con PowerShell 7+ (pwsh). Avviare lo script con powershell.exe.",
+        "Ambiente non supportato",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error)
+    exit 1
+}
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -40,7 +66,15 @@ $fntSm   = New-Object System.Drawing.Font("Segoe UI", 7.5)
 $fntMono = New-Object System.Drawing.Font("Consolas", 8)
 $fntH1   = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
 $fntBrand1 = New-Object System.Drawing.Font("Segoe UI", 7)
-$fntBrand2 = New-Object System.Drawing.Font("Century Gothic", 7, [System.Drawing.FontStyle]::Bold)
+
+# "Century Gothic" non e' un font di sistema Windows (richiede Office/CorelDraw):
+# se assente si ripiega su Segoe UI per non degradare silenziosamente il branding.
+function Test-FontInstalled([string]$familyName) {
+    $collection = New-Object System.Drawing.Text.InstalledFontCollection
+    return [bool]($collection.Families | Where-Object { $_.Name -eq $familyName })
+}
+$brandFontName = if (Test-FontInstalled "Century Gothic") { "Century Gothic" } else { "Segoe UI" }
+$fntBrand2 = New-Object System.Drawing.Font($brandFontName, 7, [System.Drawing.FontStyle]::Bold)
 
 # ─────────────────────────────────────────────
 #  FORM PRINCIPALE
@@ -66,7 +100,7 @@ $form.Controls.Add($header)
 
 $lblTitle = New-Object System.Windows.Forms.Label
 $lblTitle.Text      = "ESTRAI P7M"
-$lblTitle.Font      = New-Object System.Drawing.Font("Century Gothic", 13, [System.Drawing.FontStyle]::Bold)
+$lblTitle.Font      = New-Object System.Drawing.Font($brandFontName, 13, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor = [System.Drawing.Color]::White
 $lblTitle.AutoSize  = $true
 $lblTitle.Location  = New-Object System.Drawing.Point($mL, 14)
@@ -287,37 +321,104 @@ function Log-Muted($msg)   { Log-Line $msg $clrLogMuted }
 function Log-Header($msg)  { Log-Line $msg ([System.Drawing.Color]::FromArgb(220,220,200)) }
 
 # ─────────────────────────────────────────────
+#  HELPER: rileva l'estensione dal contenuto (magic bytes)
+#  Usato solo quando il nome del file non ha gia' un'estensione
+#  interna (es. "documento.p7m" invece di "fattura.pdf.p7m").
+# ─────────────────────────────────────────────
+function Get-ContentExtension([byte[]]$bytes) {
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return $null }
+
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0x25 -and $bytes[1] -eq 0x50 -and `
+        $bytes[2] -eq 0x44 -and $bytes[3] -eq 0x46) { return ".pdf" }              # %PDF
+
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and `
+        ($bytes[2] -eq 0x03 -or $bytes[2] -eq 0x05 -or $bytes[2] -eq 0x07)) { return ".zip" }  # PK.. (zip/docx/xlsx/odt)
+
+    if ($bytes.Length -ge 8 -and $bytes[0] -eq 0x89 -and $bytes[1] -eq 0x50 -and `
+        $bytes[2] -eq 0x4E -and $bytes[3] -eq 0x47) { return ".png" }
+
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xD8 -and $bytes[2] -eq 0xFF) { return ".jpg" }
+
+    $offset = 0
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $offset = 3 }
+    $probeLen = [Math]::Min(64, $bytes.Length - $offset)
+    if ($probeLen -gt 0) {
+        $text = [System.Text.Encoding]::ASCII.GetString($bytes, $offset, $probeLen).TrimStart()
+        if ($text.StartsWith("<?xml") -or $text.StartsWith("<")) { return ".xml" }
+    }
+
+    return $null
+}
+
+# ─────────────────────────────────────────────
 #  CORE — ESTRAZIONE SINGOLO FILE
 # ─────────────────────────────────────────────
 function Extract-SingleP7M {
     param([string]$p7mPath, [bool]$overwrite)
 
-    $dir     = Split-Path $p7mPath -Parent
-    $outDir  = Join-Path $dir "_PDF"
+    $dir    = Split-Path $p7mPath -Parent
+    $outDir = Join-Path $dir "_PDF"
 
     if (-not (Test-Path $outDir)) {
         New-Item -ItemType Directory -Path $outDir | Out-Null
         Log-Muted "  → Creata cartella: $outDir"
     }
 
-    # nome output: rimuove .p7m, mantiene estensione interna (es. fattura.pdf.p7m → fattura.pdf)
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($p7mPath)  # "fattura.pdf"
-    # se il nome base non ha estensione riconoscibile, aggiungiamo .pdf come fallback
-    if ([System.IO.Path]::GetExtension($baseName) -eq "") {
-        $baseName = "$baseName.pdf"
+    # rimuove tutte le estensioni .p7m finali (gestisce anche buste firmate due volte,
+    # es. fattura.pdf.p7m.p7m), mantenendo l'estensione interna se presente
+    $baseName = [System.IO.Path]::GetFileName($p7mPath)
+    while ($baseName.ToLowerInvariant().EndsWith(".p7m")) {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($baseName)
     }
-    $destPath = Join-Path $outDir $baseName
+    $nameHasExt = [System.IO.Path]::GetExtension($baseName) -ne ""
 
-    if ((Test-Path $destPath) -and (-not $overwrite)) {
-        Log-Muted "  ⊘ Saltato (esiste): $baseName"
-        return @{ status = "skipped" }
+    if ($nameHasExt) {
+        $destPath = Join-Path $outDir $baseName
+        if ((Test-Path $destPath) -and (-not $overwrite)) {
+            Log-Muted "  ⊘ Saltato (esiste): $baseName"
+            return @{ status = "skipped" }
+        }
     }
 
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($p7mPath)
-        $cms   = New-Object System.Security.Cryptography.Pkcs.SignedCms
-        $cms.Decode($bytes)
-        $payload = $cms.ContentInfo.Content
+        $payload = [System.IO.File]::ReadAllBytes($p7mPath)
+
+        # Decodifica CMS; segue eventuali buste annidate (doppia firma)
+        for ($i = 0; $i -lt 5; $i++) {
+            $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms
+            $cms.Decode($payload)
+            $decoded = $cms.ContentInfo.Content
+
+            if ($null -eq $decoded -or $decoded.Length -eq 0) {
+                Log-Err "  ✖ Busta vuota o firma 'detached' (nessun contenuto incorporato): $([System.IO.Path]::GetFileName($p7mPath))"
+                return @{ status = "error" }
+            }
+            $payload = $decoded
+
+            $isNestedCms = $false
+            try {
+                $peek = New-Object System.Security.Cryptography.Pkcs.SignedCms
+                $peek.Decode($payload)
+                $isNestedCms = $true
+            } catch { }
+            if (-not $isNestedCms) { break }
+        }
+
+        if (-not $nameHasExt) {
+            $ext = Get-ContentExtension $payload
+            if ($null -ne $ext) {
+                $baseName = "$baseName$ext"
+            } else {
+                Log-Muted "  ⚠ Estensione non rilevabile dal contenuto, uso '.pdf' come fallback per: $([System.IO.Path]::GetFileName($p7mPath))"
+                $baseName = "$baseName.pdf"
+            }
+            $destPath = Join-Path $outDir $baseName
+            if ((Test-Path $destPath) -and (-not $overwrite)) {
+                Log-Muted "  ⊘ Saltato (esiste): $baseName"
+                return @{ status = "skipped" }
+            }
+        }
+
         [System.IO.File]::WriteAllBytes($destPath, $payload)
         Log-Ok  "  ✔ $([System.IO.Path]::GetFileName($p7mPath))  →  _PDF\$baseName"
         return @{ status = "ok" }
@@ -329,13 +430,49 @@ function Extract-SingleP7M {
 }
 
 # ─────────────────────────────────────────────
+#  HELPER: scansione ricorsiva sicura dei .p7m
+#  A differenza di Directory.GetFiles(..., AllDirectories), non
+#  interrompe l'intera scansione se una sottocartella nega l'accesso.
+# ─────────────────────────────────────────────
+function Get-P7mFilesSafe {
+    param([string]$folderPath, [bool]$recurse)
+
+    $result = New-Object System.Collections.Generic.List[string]
+    $queue  = New-Object System.Collections.Generic.Queue[string]
+    $queue.Enqueue($folderPath)
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+
+        try {
+            foreach ($f in [System.IO.Directory]::GetFiles($current, "*.p7m")) {
+                $result.Add($f)
+            }
+        } catch {
+            Log-Err "  ✖ Impossibile leggere la cartella: $current — $($_.Exception.Message)"
+        }
+
+        if ($recurse) {
+            try {
+                foreach ($d in [System.IO.Directory]::GetDirectories($current)) {
+                    $queue.Enqueue($d)
+                }
+            } catch {
+                Log-Err "  ✖ Impossibile enumerare le sottocartelle di: $current — $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return $result
+}
+
+# ─────────────────────────────────────────────
 #  CORE — ESTRAZIONE BATCH (cartella)
 # ─────────────────────────────────────────────
 function Extract-Folder {
     param([string]$folderPath, [bool]$recurse, [bool]$overwrite)
 
-    $depth = if ($recurse) { "AllDirectories" } else { "TopDirectoryOnly" }
-    $files = [System.IO.Directory]::GetFiles($folderPath, "*.p7m", $depth)
+    $files = Get-P7mFilesSafe -folderPath $folderPath -recurse $recurse
 
     if ($files.Count -eq 0) {
         Log-Muted "Nessun file .p7m trovato."
@@ -344,12 +481,17 @@ function Extract-Folder {
 
     $ok=0; $skip=0; $err=0
     foreach ($f in $files) {
+        if ($script:cancelRequested) {
+            Log-Muted "Operazione annullata dall'utente."
+            break
+        }
         $res = Extract-SingleP7M -p7mPath $f -overwrite $overwrite
         switch ($res.status) {
             "ok"      { $ok++ }
             "skipped" { $skip++ }
             "error"   { $err++ }
         }
+        [System.Windows.Forms.Application]::DoEvents()
     }
     return @{ ok=$ok; skipped=$skip; errors=$err }
 }
@@ -396,9 +538,29 @@ $btnClear.Add_Click({
 })
 
 # ─────────────────────────────────────────────
-#  PULSANTE ESTRAI
+#  PULSANTE ESTRAI  (con annullamento e UI reattiva)
 # ─────────────────────────────────────────────
+$script:isRunning       = $false
+$script:cancelRequested = $false
+
+function Set-UIBusy([bool]$busy) {
+    $btnClear.Enabled     = -not $busy
+    $rbFile.Enabled       = -not $busy
+    $rbFolder.Enabled     = -not $busy
+    $txtSrc.Enabled       = -not $busy
+    $btnBrowse.Enabled    = -not $busy
+    $chkOverwrite.Enabled = -not $busy
+    $chkRecurse.Enabled   = (-not $busy) -and $rbFolder.Checked
+    $btnEstrai.Text       = if ($busy) { "■  Annulla" } else { "▶  Estrai" }
+}
+
 $btnEstrai.Add_Click({
+    if ($script:isRunning) {
+        $script:cancelRequested = $true
+        $btnEstrai.Enabled = $false
+        return
+    }
+
     $src = $txtSrc.Text.Trim()
     if ([string]::IsNullOrEmpty($src)) {
         [System.Windows.Forms.MessageBox]::Show(
@@ -412,40 +574,59 @@ $btnEstrai.Add_Click({
     $overwrite = $chkOverwrite.Checked
     $tstamp    = (Get-Date).ToString("HH:mm:ss")
 
+    $script:isRunning       = $true
+    $script:cancelRequested = $false
+    Set-UIBusy $true
+
     Log-Header "────────────────────────────────────────"
     Log-Header "[$tstamp]  Avvio estrazione"
 
-    if ($rbFile.Checked) {
-        if (-not (Test-Path $src)) {
-            Log-Err "File non trovato: $src"
-            return
+    $ok = 0; $skip = 0; $err = 0
+    try {
+        if ($rbFile.Checked) {
+            if (-not (Test-Path $src)) {
+                Log-Err "File non trovato: $src"
+                $err = 1
+            } else {
+                Log-Muted "File: $src"
+                $res  = Extract-SingleP7M -p7mPath $src -overwrite $overwrite
+                $ok   = if ($res.status -eq "ok")      { 1 } else { 0 }
+                $skip = if ($res.status -eq "skipped") { 1 } else { 0 }
+                $err  = if ($res.status -eq "error")   { 1 } else { 0 }
+            }
+        } else {
+            if (-not (Test-Path $src -PathType Container)) {
+                Log-Err "Cartella non trovata: $src"
+                $err = 1
+            } else {
+                $recurse = $chkRecurse.Checked
+                Log-Muted "Cartella: $src"
+                Log-Muted "Ricorsiva: $(if ($recurse) {'Si'} else {'No'})"
+                $r    = Extract-Folder -folderPath $src -recurse $recurse -overwrite $overwrite
+                $ok   = $r.ok; $skip = $r.skipped; $err = $r.errors
+            }
         }
-        Log-Muted "File: $src"
-        $res = Extract-SingleP7M -p7mPath $src -overwrite $overwrite
-        $ok    = if ($res.status -eq "ok")      { 1 } else { 0 }
-        $skip  = if ($res.status -eq "skipped") { 1 } else { 0 }
-        $err   = if ($res.status -eq "error")   { 1 } else { 0 }
-    } else {
-        if (-not (Test-Path $src -PathType Container)) {
-            Log-Err "Cartella non trovata: $src"
-            return
-        }
-        $recurse = $chkRecurse.Checked
-        Log-Muted "Cartella: $src"
-        Log-Muted "Ricorsiva: $(if ($recurse) {'Si'} else {'No'})"
-        $r   = Extract-Folder -folderPath $src -recurse $recurse -overwrite $overwrite
-        $ok  = $r.ok; $skip = $r.skipped; $err = $r.errors
     }
+    catch {
+        Log-Err "✖ Errore imprevisto: $($_.Exception.Message)"
+        $err++
+    }
+    finally {
+        # Sommario
+        Log-Header "────────────────────────────────────────"
+        $summary = "Completato — ✔ $ok estratti  ⊘ $skip saltati  ✖ $err errori"
+        if ($err -gt 0) { Log-Err  $summary } else { Log-Ok $summary }
+        Log-Line ""
 
-    # Sommario
-    Log-Header "────────────────────────────────────────"
-    $summary = "Completato — ✔ $ok estratti  ⊘ $skip saltati  ✖ $err errori"
-    if ($err -gt 0) { Log-Err  $summary } else { Log-Ok $summary }
-    Log-Line ""
+        # Contatore in-form
+        $lblStats.Text = "Ultima esecuzione:  ✔ $ok  ⊘ $skip  ✖ $err"
+        $lblStats.ForeColor = if ($err -gt 0) { $clrLogErr } else { $clrGreen }
 
-    # Contatore in-form
-    $lblStats.Text = "Ultima esecuzione:  ✔ $ok  ⊘ $skip  ✖ $err"
-    $lblStats.ForeColor = if ($err -gt 0) { $clrLogErr } else { $clrGreen }
+        $script:isRunning       = $false
+        $script:cancelRequested = $false
+        Set-UIBusy $false
+        $btnEstrai.Enabled = $true
+    }
 })
 
 # ─────────────────────────────────────────────
@@ -462,8 +643,8 @@ $form.Add_Shown({
 #  Uso: EstraiP7M.ps1 "C:\path\file.p7m"
 #       EstraiP7M.ps1 "C:\path\cartella"
 # ─────────────────────────────────────────────
-if ($args.Count -gt 0) {
-    $argPath = $args[0].Trim('"')
+if (-not [string]::IsNullOrWhiteSpace($Path)) {
+    $argPath = $Path.Trim('"')
     if (Test-Path $argPath -PathType Leaf) {
         # File: imposta radio + path
         $rbFile.Checked  = $true

@@ -1,0 +1,14 @@
+# Output di estrazione
+_PDF/
+
+# File temporanei di sistema
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+*.code-workspace
+
+# Log
+*.log
