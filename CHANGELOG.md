@@ -7,6 +7,7 @@ Tutte le modifiche rilevanti allo script sono documentate in questo file.
 ### Aggiunto
 - Riconoscimento automatico del tipo di file contenuto nella busta `.p7m` tramite analisi dei magic bytes del payload (`Get-DetectedExtension`): PDF, XML (con/senza BOM), JPEG, PNG, GIF, TIFF, BMP, RTF, buste P7M annidate e formati ZIP-based (docx/xlsx/pptx/odt), questi ultimi distinti ispezionando i percorsi interni all'archivio (`Get-ZipInnerExtension`).
 - Log informativo quando l'estensione dichiarata nel nome del file originale differisce da quella rilevata nel contenuto.
+- Versione eseguibile standalone `EstraiP7M.exe` (compilata con `ps2exe`), utilizzabile senza PowerShell configurato; script di build `Build-Exe.ps1` per rigenerarla dopo ogni modifica.
 
 ### Modificato
 - L'estensione del file estratto è ora decisa con priorità: contenuto rilevato → estensione presente nel nome file → fallback `.pdf`, al posto del solo fallback automatico su `.pdf` quando il nome non conteneva un'estensione riconoscibile.

@@ -18,20 +18,36 @@ Utility Windows (PowerShell + WinForms) per estrarre il payload firmato da buste
 
 ## Uso
 
-1. Esegui `EstraiP7M.ps1` (doppio click, o `ctb_gui.bat`-style wrapper se presente, oppure da PowerShell).
+**Versione eseguibile (consigliata per utenti finali):** doppio click su `EstraiP7M.exe`. Non richiede PowerShell configurato né di sbloccare l'esecuzione script (`ExecutionPolicy`); è lo stesso script compilato in un unico `.exe` standalone, senza dipendenze da installare.
+
+**Versione script:**
+
+1. Esegui `EstraiP7M.ps1` (doppio click se l'esecuzione script è abilitata, oppure da PowerShell).
 2. Scegli **File singolo** o **Cartella** come sorgente.
 3. Sfoglia o incolla il percorso.
 4. Se la sorgente è una cartella, spunta **Includi sottocartelle** per la ricerca ricorsiva dei `.p7m`.
 5. Spunta **Sovrascrivi** se vuoi rigenerare file già estratti in precedenza.
 6. Premi **Estrai**: i file vengono salvati in `_PDF` accanto agli originali, con estensione dedotta dal contenuto.
 
-Uso da riga di comando / menu contestuale:
+Uso da riga di comando / menu contestuale (funziona sia con lo script che con l'exe):
 
 ```
 powershell -File EstraiP7M.ps1 "C:\percorso\fattura.p7m"
-powershell -File EstraiP7M.ps1 "C:\percorso\cartella"
+EstraiP7M.exe "C:\percorso\cartella"
 ```
+
+## Compilare l'eseguibile
+
+`EstraiP7M.exe` è generato da `EstraiP7M.ps1` tramite il modulo [ps2exe](https://www.powershellgallery.com/packages/ps2exe). Dopo ogni modifica allo script, ricompila con:
+
+```
+powershell -File Build-Exe.ps1
+```
+
+Aggiorna il numero di versione nello script `Build-Exe.ps1` (parametro `-version`) in coerenza con `CHANGELOG.md`.
 
 ## Struttura del codice
 
 - `EstraiP7M.ps1` — intero script: interfaccia WinForms, riconoscimento del tipo di file (`Get-DetectedExtension`, `Get-ZipInnerExtension`, `Test-BytePrefix`), estrazione della busta CMS/PKCS#7 (`Extract-SingleP7M`, `Extract-Folder`) e gestione eventi UI.
+- `EstraiP7M.exe` — build standalone dello script, generata con `Build-Exe.ps1`.
+- `Build-Exe.ps1` — script di compilazione (ps2exe) usato per rigenerare l'exe.
