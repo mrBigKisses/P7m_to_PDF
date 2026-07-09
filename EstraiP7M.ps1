@@ -7,6 +7,7 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Security
+Add-Type -AssemblyName System.IO.Compression
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -287,6 +288,68 @@ function Log-Muted($msg)   { Log-Line $msg $clrLogMuted }
 function Log-Header($msg)  { Log-Line $msg ([System.Drawing.Color]::FromArgb(220,220,200)) }
 
 # ─────────────────────────────────────────────
+#  RICONOSCIMENTO TIPO FILE DA CONTENUTO (magic bytes)
+# ─────────────────────────────────────────────
+function Test-BytePrefix {
+    param([byte[]]$Bytes, [byte[]]$Signature, [int]$Offset = 0)
+    if ($Bytes.Length -lt ($Offset + $Signature.Length)) { return $false }
+    for ($i = 0; $i -lt $Signature.Length; $i++) {
+        if ($Bytes[$Offset + $i] -ne $Signature[$i]) { return $false }
+    }
+    return $true
+}
+
+function Get-ZipInnerExtension {
+    param([byte[]]$Bytes)
+    try {
+        $ms  = New-Object System.IO.MemoryStream(,$Bytes)
+        $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Read)
+        $names = $zip.Entries | ForEach-Object { $_.FullName }
+        $zip.Dispose()
+        $ms.Dispose()
+        if ($names -match "^word/")     { return "docx" }
+        if ($names -match "^xl/")       { return "xlsx" }
+        if ($names -match "^ppt/")      { return "pptx" }
+        if ($names -contains "mimetype"){ return "odt" }
+        return "zip"
+    }
+    catch { return "zip" }
+}
+
+function Get-DetectedExtension {
+    param([byte[]]$Bytes)
+
+    if ($null -eq $Bytes -or $Bytes.Length -lt 4) { return $null }
+
+    if (Test-BytePrefix $Bytes @(0x25,0x50,0x44,0x46))                                   { return "pdf" }
+    if ((Test-BytePrefix $Bytes @(0x50,0x4B,0x03,0x04)) -or
+        (Test-BytePrefix $Bytes @(0x50,0x4B,0x05,0x06)) -or
+        (Test-BytePrefix $Bytes @(0x50,0x4B,0x07,0x08)))                                 { return Get-ZipInnerExtension $Bytes }
+    if (Test-BytePrefix $Bytes @(0xFF,0xD8,0xFF))                                        { return "jpg" }
+    if (Test-BytePrefix $Bytes @(0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A))                { return "png" }
+    if (Test-BytePrefix $Bytes @(0x47,0x49,0x46,0x38))                                   { return "gif" }
+    if ((Test-BytePrefix $Bytes @(0x49,0x49,0x2A,0x00)) -or
+        (Test-BytePrefix $Bytes @(0x4D,0x4D,0x00,0x2A)))                                 { return "tif" }
+    if (Test-BytePrefix $Bytes @(0x42,0x4D))                                             { return "bmp" }
+    if (Test-BytePrefix $Bytes @(0x7B,0x5C,0x72,0x74,0x66))                               { return "rtf" }
+
+    # XML (con o senza BOM UTF-8)
+    $offset = if (Test-BytePrefix $Bytes @(0xEF,0xBB,0xBF)) { 3 } else { 0 }
+    $probeLen = [Math]::Min(200, $Bytes.Length - $offset)
+    if ($probeLen -gt 0) {
+        $head = [System.Text.Encoding]::ASCII.GetString($Bytes, $offset, $probeLen).TrimStart()
+        if ($head.StartsWith("<?xml", [StringComparison]::OrdinalIgnoreCase) -or $head.StartsWith("<")) {
+            return "xml"
+        }
+    }
+
+    # busta CMS/PKCS7 annidata (doppia firma)
+    if (Test-BytePrefix $Bytes @(0x30,0x82)) { return "p7m" }
+
+    return $null
+}
+
+# ─────────────────────────────────────────────
 #  CORE — ESTRAZIONE SINGOLO FILE
 # ─────────────────────────────────────────────
 function Extract-SingleP7M {
@@ -300,12 +363,39 @@ function Extract-SingleP7M {
         Log-Muted "  → Creata cartella: $outDir"
     }
 
-    # nome output: rimuove .p7m, mantiene estensione interna (es. fattura.pdf.p7m → fattura.pdf)
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($p7mPath)  # "fattura.pdf"
-    # se il nome base non ha estensione riconoscibile, aggiungiamo .pdf come fallback
-    if ([System.IO.Path]::GetExtension($baseName) -eq "") {
-        $baseName = "$baseName.pdf"
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($p7mPath)
+        $cms   = New-Object System.Security.Cryptography.Pkcs.SignedCms
+        $cms.Decode($bytes)
+        $payload = $cms.ContentInfo.Content
     }
+    catch {
+        Log-Err "  ✖ Errore: $([System.IO.Path]::GetFileName($p7mPath)) — $($_.Exception.Message)"
+        return @{ status = "error" }
+    }
+
+    # nome output: rimuove .p7m; l'estensione si deduce dal contenuto reale del payload,
+    # con fallback sull'estensione presente nel nome (es. fattura.pdf.p7m) e infine su .pdf
+    $origBase  = [System.IO.Path]::GetFileNameWithoutExtension($p7mPath)   # "fattura.pdf" o "fattura"
+    $nameExt   = [System.IO.Path]::GetExtension($origBase).TrimStart(".")
+    $baseNoExt = [System.IO.Path]::GetFileNameWithoutExtension($origBase)
+
+    $detectedExt = Get-DetectedExtension $payload
+
+    if ($detectedExt -and $nameExt -and ($nameExt.ToLower() -ne $detectedExt.ToLower())) {
+        Log-Muted "  ℹ Contenuto rilevato come .$detectedExt (il nome indicava .$nameExt)"
+    }
+
+    if ($detectedExt) {
+        $finalExt = $detectedExt
+    } elseif ($nameExt) {
+        $finalExt = $nameExt
+    } else {
+        Log-Muted "  ℹ Tipo di file non riconosciuto — uso estensione di fallback .pdf"
+        $finalExt = "pdf"
+    }
+
+    $baseName = "$baseNoExt.$finalExt"
     $destPath = Join-Path $outDir $baseName
 
     if ((Test-Path $destPath) -and (-not $overwrite)) {
@@ -314,10 +404,6 @@ function Extract-SingleP7M {
     }
 
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($p7mPath)
-        $cms   = New-Object System.Security.Cryptography.Pkcs.SignedCms
-        $cms.Decode($bytes)
-        $payload = $cms.ContentInfo.Content
         [System.IO.File]::WriteAllBytes($destPath, $payload)
         Log-Ok  "  ✔ $([System.IO.Path]::GetFileName($p7mPath))  →  _PDF\$baseName"
         return @{ status = "ok" }
@@ -378,14 +464,24 @@ $btnBrowse.Add_Click({
             $txtSrc.Text = $dlg.FileName
         }
     } else {
-        # Dialog stile Explorer con barra path editabile
-        # Flags: BIF_RETURNONLYFSDIRS(1) + BIF_EDITBOX(16) + BIF_NEWDIALOGSTYLE(64) = 81
-        $shell  = New-Object -ComObject Shell.Application
-        $picked = $shell.BrowseForFolder(0, "Seleziona la cartella contenente i file .p7m", 81, "")
-        if ($null -ne $picked) {
-            $txtSrc.Text = $picked.Self.Path
+        # Dialog "Apri file" moderno di Windows (barra indirizzi, sidebar, ricerca),
+        # forzato alla sola selezione cartella: il filtro esclude ogni file reale,
+        # quindi si può navigare o incollare un percorso e premere Apri.
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Title            = "Seleziona la cartella contenente i file .p7m"
+        $dlg.CheckFileExists  = $false
+        $dlg.CheckPathExists  = $true
+        $dlg.ValidateNames    = $false
+        $dlg.Multiselect      = $false
+        $dlg.FileName         = "Seleziona questa cartella"
+        $dlg.Filter           = "Cartelle|*.$([guid]::NewGuid().ToString('N'))"
+        if ($dlg.ShowDialog() -eq "OK") {
+            if (Test-Path $dlg.FileName -PathType Container) {
+                $txtSrc.Text = $dlg.FileName
+            } else {
+                $txtSrc.Text = [System.IO.Path]::GetDirectoryName($dlg.FileName)
+            }
         }
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
     }
 })
 
