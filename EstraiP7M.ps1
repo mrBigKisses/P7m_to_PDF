@@ -4,6 +4,32 @@
 #  Supporta file singolo, cartella, ricorsione sottocartelle
 #  Output sempre in sottocartella _PDF accanto all'originale
 # ============================================================
+
+# ─────────────────────────────────────────────
+#  ISTANZA SINGOLA — selezione multipla da Explorer/OneCommander
+#  Molti file manager (Explorer in modalita' predefinita "Document",
+#  OneCommander) lanciano un processo separato per ciascun file
+#  selezionato invece di uno solo con tutti i file. Per evitare N
+#  finestre su una selezione di N file: la prima istanza diventa
+#  "primaria" e resta in ascolto; ogni istanza successiva deposita il
+#  proprio file in una coda condivisa (cartella temporanea) e termina
+#  subito, senza mostrare finestra.
+# ─────────────────────────────────────────────
+$script:instanceMutexName = "STUDIOIO_EstraiP7M_SingleInstance"
+$script:inboxDir          = Join-Path $env:TEMP "EstraiP7M_inbox"
+$script:instanceMutex     = New-Object System.Threading.Mutex($false, $script:instanceMutexName)
+$script:isPrimaryInstance = $script:instanceMutex.WaitOne(200)
+
+# La modalità a istanza singola scatta solo se l'invocazione porta argomenti
+# (selezione da menu contestuale). Un doppio click manuale senza argomenti
+# apre sempre una finestra normale, anche se un'altra istanza è già aperta.
+if (-not $script:isPrimaryInstance -and $args.Count -gt 0) {
+    New-Item -ItemType Directory -Path $script:inboxDir -Force | Out-Null
+    $dropFile = Join-Path $script:inboxDir ([guid]::NewGuid().ToString('N') + '.txt')
+    ($args | ForEach-Object { $_.Trim('"') }) | Set-Content -Path $dropFile -Encoding UTF8
+    exit 0
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Security
@@ -178,6 +204,48 @@ $chkRecurse.AutoSize = $true
 $chkRecurse.Checked  = $false
 $chkRecurse.Visible  = $false
 $form.Controls.Add($chkRecurse)
+
+# ─────────────────────────────────────────────
+#  BATCH MULTI-ELEMENTO (selezione multipla da menu contestuale)
+#  Elenco di percorsi (file .p7m e/o cartelle) accumulati da una
+#  selezione multipla, arrivati come argomenti diretti o inoltrati
+#  dalla coda di istanze secondarie (vedi Receive-QueuedItems).
+# ─────────────────────────────────────────────
+$script:batchItems = @()
+
+function Add-ItemsToBatch {
+    param([string[]]$Paths)
+
+    $valid = @(
+        $Paths |
+        ForEach-Object { $_.Trim('"') } |
+        Where-Object { (Test-Path $_ -PathType Leaf) -or (Test-Path $_ -PathType Container) }
+    )
+    if ($valid.Count -eq 0) { return }
+
+    $script:batchItems = @($script:batchItems + $valid | Select-Object -Unique)
+
+    $hasFolder = [bool]($script:batchItems | Where-Object { Test-Path $_ -PathType Container })
+
+    $rbFile.Enabled     = $false
+    $rbFolder.Enabled   = $false
+    $btnBrowse.Enabled  = $false
+    $chkRecurse.Visible = $hasFolder
+
+    $txtSrc.ReadOnly = $true
+    $count = $script:batchItems.Count
+    $txtSrc.Text = if ($count -eq 1) { "1 elemento selezionato" } else { "$count elementi selezionati" }
+}
+
+function Clear-Batch {
+    $script:batchItems = @()
+    $rbFile.Enabled     = $true
+    $rbFolder.Enabled   = $true
+    $btnBrowse.Enabled  = $true
+    $chkRecurse.Visible = $rbFolder.Checked
+    $txtSrc.ReadOnly    = $false
+    $txtSrc.Text        = ""
+}
 
 # ─────────────────────────────────────────────
 #  SEZIONE 2 — OPZIONI OUTPUT
@@ -495,23 +563,48 @@ $btnClear.Add_Click({
 #  PULSANTE ESTRAI
 # ─────────────────────────────────────────────
 $btnEstrai.Add_Click({
-    $src = $txtSrc.Text.Trim()
-    if ([string]::IsNullOrEmpty($src)) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Seleziona prima un file o una cartella sorgente.",
-            "Sorgente mancante",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Warning)
-        return
-    }
-
     $overwrite = $chkOverwrite.Checked
     $tstamp    = (Get-Date).ToString("HH:mm:ss")
+
+    if ($script:batchItems.Count -eq 0) {
+        $src = $txtSrc.Text.Trim()
+        if ([string]::IsNullOrEmpty($src)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Seleziona prima un file o una cartella sorgente.",
+                "Sorgente mancante",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+    }
 
     Log-Header "────────────────────────────────────────"
     Log-Header "[$tstamp]  Avvio estrazione"
 
-    if ($rbFile.Checked) {
+    if ($script:batchItems.Count -gt 0) {
+        # Selezione multipla (file e/o cartelle) da menu contestuale
+        $recurse = $chkRecurse.Checked
+        Log-Muted "Elementi selezionati: $($script:batchItems.Count)"
+        $ok=0; $skip=0; $err=0
+        foreach ($item in $script:batchItems) {
+            if (Test-Path $item -PathType Leaf) {
+                $res = Extract-SingleP7M -p7mPath $item -overwrite $overwrite
+                switch ($res.status) {
+                    "ok"      { $ok++ }
+                    "skipped" { $skip++ }
+                    "error"   { $err++ }
+                }
+            }
+            elseif (Test-Path $item -PathType Container) {
+                Log-Muted "Cartella: $item  (ricorsiva: $(if ($recurse) {'Si'} else {'No'}))"
+                $r = Extract-Folder -folderPath $item -recurse $recurse -overwrite $overwrite
+                $ok += $r.ok; $skip += $r.skipped; $err += $r.errors
+            }
+        }
+        Clear-Batch
+    }
+    elseif ($rbFile.Checked) {
+        $src = $txtSrc.Text.Trim()
         if (-not (Test-Path $src)) {
             Log-Err "File non trovato: $src"
             return
@@ -522,6 +615,7 @@ $btnEstrai.Add_Click({
         $skip  = if ($res.status -eq "skipped") { 1 } else { 0 }
         $err   = if ($res.status -eq "error")   { 1 } else { 0 }
     } else {
+        $src = $txtSrc.Text.Trim()
         if (-not (Test-Path $src -PathType Container)) {
             Log-Err "Cartella non trovata: $src"
             return
@@ -554,26 +648,71 @@ $form.Add_Shown({
 })
 
 # ─────────────────────────────────────────────
+#  CODA CONDIVISA — assorbe i file/cartelle depositati dalle istanze
+#  secondarie (vedi il blocco "ISTANZA SINGOLA" in cima allo script)
+# ─────────────────────────────────────────────
+function Receive-QueuedItems {
+    $dropFiles = Get-ChildItem -Path $script:inboxDir -Filter '*.txt' -File -ErrorAction SilentlyContinue
+    if (-not $dropFiles) { return }
+
+    $newPaths = @()
+    foreach ($df in $dropFiles) {
+        try {
+            $lines = @(Get-Content -Path $df.FullName -ErrorAction Stop)
+            $newPaths += @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        } catch { }
+        Remove-Item $df.FullName -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($newPaths.Count -gt 0) {
+        Add-ItemsToBatch $newPaths
+        if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+            $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        }
+        $form.Activate()
+    }
+}
+
+# Solo l'istanza primaria ascolta la coda: un'eventuale finestra manuale
+# aperta mentre un'altra è già primaria non deve contendersi gli stessi file.
+if ($script:isPrimaryInstance) {
+    $script:queueTimer = New-Object System.Windows.Forms.Timer
+    $script:queueTimer.Interval = 400
+    $script:queueTimer.Add_Tick({ Receive-QueuedItems })
+    $script:queueTimer.Start()
+
+    $form.Add_FormClosed({
+        $script:queueTimer.Stop()
+        try { $script:instanceMutex.ReleaseMutex() } catch { }
+    })
+}
+
+# ─────────────────────────────────────────────
 #  PRE-FILL DA ARGOMENTO (menu contestuale)
 #  Uso: EstraiP7M.ps1 "C:\path\file.p7m"
 #       EstraiP7M.ps1 "C:\path\cartella"
+#       EstraiP7M.ps1 "C:\a.p7m" "C:\b.p7m" ...   (selezione multipla)
+#  Una singola cartella resta nella modalità classica con opzione di
+#  ricorsione; uno o più file, o più elementi misti, confluiscono nel
+#  batch multi-elemento (stesso meccanismo della coda condivisa sopra).
 # ─────────────────────────────────────────────
 if ($args.Count -gt 0) {
-    $argPath = $args[0].Trim('"')
-    if (Test-Path $argPath -PathType Leaf) {
-        # File: imposta radio + path
-        $rbFile.Checked  = $true
-        $rbFolder.Checked = $false
-        $txtSrc.Text      = $argPath
-        $chkRecurse.Visible = $false
-    } elseif (Test-Path $argPath -PathType Container) {
-        # Cartella: imposta radio + path
-        $rbFolder.Checked = $true
-        $rbFile.Checked   = $false
-        $txtSrc.Text       = $argPath
+    $incomingPaths = @($args | ForEach-Object { $_.Trim('"') })
+
+    if ($incomingPaths.Count -eq 1 -and (Test-Path $incomingPaths[0] -PathType Container)) {
+        $rbFolder.Checked   = $true
+        $rbFile.Checked     = $false
+        $txtSrc.Text        = $incomingPaths[0]
         $chkRecurse.Visible = $true
     }
+    else {
+        Add-ItemsToBatch $incomingPaths
+    }
 }
+
+# Assorbe eventuali code residue di istanze partite subito prima di questa
+# (piccola finestra di corsa tra il rilascio del mutex e l'avvio dell'ascolto).
+if ($script:isPrimaryInstance) { Receive-QueuedItems }
 
 # ─────────────────────────────────────────────
 #  AVVIO

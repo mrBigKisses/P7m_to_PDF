@@ -10,6 +10,7 @@ Utility Windows (PowerShell + WinForms) per estrarre il payload firmato da buste
 - **Selezione cartella con dialog Explorer moderno**: barra indirizzi, sidebar Accesso rapido e ricerca — stesso dialog "Apri file" usato dalle app Windows più recenti, in cui è possibile incollare direttamente un percorso.
 - **Log a schermo** con esito per ogni file (estratto / saltato / errore) e riepilogo finale.
 - **Integrazione da menu contestuale**: può ricevere come argomento un file o una cartella (es. da una voce di menu "Invia a" o da un file `.bat`/registro di sistema).
+- **Istanza singola su selezione multipla**: selezionando più file/cartelle e lanciando il comando dal menu contestuale, si apre **una sola finestra** che raccoglie tutti gli elementi, anche se il file manager (Explorer in modalità predefinita, OneCommander) lancia un processo separato per ciascun elemento selezionato. La prima istanza avviata resta in ascolto; le successive inoltrano il proprio elemento e terminano subito senza mostrare finestra.
 
 ## Requisiti
 

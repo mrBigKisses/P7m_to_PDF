@@ -2,6 +2,13 @@
 
 Tutte le modifiche rilevanti allo script sono documentate in questo file.
 
+## [1.2] - 2026-07-31
+
+### Aggiunto
+- **Istanza singola su selezione multipla**: selezionando più file/cartelle in Explorer o OneCommander e lanciando il comando dal menu contestuale, prima si aprivano tante finestre quanti erano gli elementi selezionati. Ora la prima istanza avviata resta in ascolto (mutex con nome noto) e raccoglie tutti gli elementi in un'unica finestra; le istanze successive depositano il proprio percorso in una coda condivisa e terminano subito senza mostrare finestra. Funziona indipendentemente dal fatto che il file manager lanci un processo per elemento (comportamento predefinito di Explorer, e di OneCommander) o un solo processo con tutti gli elementi.
+- Nuova modalità "batch multi-elemento": una selezione di più file e/o cartelle confluisce in un'unica esecuzione, con lo stesso riepilogo (estratti/saltati/errori) usato per la modalità cartella.
+- Aggiunto valore di registro `MultiSelectModel=Player` sulle voci "Convert P7M to PDF" (Directory e file `.p7m`) come ottimizzazione complementare per Explorer nativo.
+
 ## [1.1] - 2026-07-09
 
 ### Aggiunto
